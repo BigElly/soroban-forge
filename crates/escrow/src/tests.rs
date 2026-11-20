@@ -19,14 +19,17 @@
 //! signature testing needs `set_auths` fixtures and is tracked in the
 //! security-invariant backlog.
 
-use crate::{DataKey, Escrow, EscrowData, EscrowDataV1, EscrowStatus, SorobanForgeEscrowClient};
+use crate::{
+    DataKey, Escrow, EscrowData, EscrowDataV1, EscrowStatus, SorobanForgeEscrowClient,
+    MAX_ARBITER_FEE_BPS,
+};
 use soroban_forge_shared_utils::{xdr_round_trip, ForgeError};
-use soroban_forge_test_utils::{FailureToken, FailureTokenClient};
+use soroban_forge_test_utils::{FailureToken, FailureTokenClient, MockEventSink};
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
 use soroban_sdk::{
     xdr::{FromXdr, ToXdr},
-    Address, Env, Vec,
+    Address, Env, Symbol, Vec,
 };
 
 const START: u64 = 1_000_000;
@@ -1394,4 +1397,172 @@ fn cancellation_of_only_remaining_index_yields_empty_first_page_and_no_cursor() 
     assert_eq!(after.total, 0);
     assert_eq!(after.ids.len(), 0);
     assert_eq!(after.next_cursor, None);
+}
+
+// -----------------------------------------------------------------------
+// Arbiter fee on dispute resolution
+// -----------------------------------------------------------------------
+
+fn create_with_fee(
+    client: &SorobanForgeEscrowClient<'_>,
+    token: &Address,
+    buyer: &Address,
+    seller: &Address,
+    arbiter: &Address,
+    arbiter_fee_bps: u32,
+) -> u64 {
+    client.create_escrow_with_arbiter_fee(
+        buyer,
+        seller,
+        arbiter,
+        token,
+        &AMOUNT,
+        &TIMEOUT,
+        &arbiter_fee_bps,
+    )
+}
+
+#[test]
+fn escrows_created_without_a_fee_pay_the_arbiter_nothing() {
+    let (_env, token, tc, contract_id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    client.deposit(&id);
+    client.dispute(&id, seller);
+
+    client.resolve(&id, &true);
+
+    assert_eq!(client.get_arbiter_fee_bps(&id), 0);
+    assert_eq!(tc.balance(arbiter), 0, "no fee means no arbiter payout");
+    assert_eq!(tc.balance(seller), AMOUNT);
+    assert_eq!(tc.balance(&contract_id), 0);
+    assert_eq!(client.get_status(&id), EscrowStatus::Completed);
+}
+
+#[test]
+fn arbiter_fee_above_the_cap_is_rejected() {
+    let (_env, token, _tc, _contract_id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+
+    let err = client
+        .try_create_escrow_with_arbiter_fee(
+            buyer,
+            seller,
+            arbiter,
+            &token,
+            &AMOUNT,
+            &TIMEOUT,
+            &(MAX_ARBITER_FEE_BPS + 1),
+        )
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ForgeError::InvalidInput);
+
+    // The cap itself is allowed and is reported back by the view.
+    let id = create_with_fee(&client, &token, buyer, seller, arbiter, MAX_ARBITER_FEE_BPS);
+    assert_eq!(client.get_arbiter_fee_bps(&id), MAX_ARBITER_FEE_BPS);
+}
+
+#[test]
+fn resolve_deducts_the_arbiter_fee_and_conserves_the_deposit() {
+    let (env, token, tc, contract_id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create_with_fee(&client, &token, buyer, seller, arbiter, 250);
+    client.deposit(&id);
+    client.dispute(&id, buyer);
+
+    client.resolve(&id, &true);
+
+    // The fee event belongs to the resolve invocation, so it must be read
+    // before the balance calls below invoke the token contract.
+    let sink = MockEventSink::new(&env, &contract_id);
+    assert_eq!(sink.count(), 2, "Resolved plus DisputeResolvedWithFee");
+    let fee_event = Symbol::new(&env, "dispute_resolved_with_fee");
+    assert!(sink
+        .events()
+        .iter()
+        .any(|event| event.has_topic(&env, &fee_event)));
+
+    // 2.5% of 1_000 is 25; the seller receives exactly the remainder.
+    assert_eq!(tc.balance(arbiter), 25);
+    assert_eq!(tc.balance(seller), AMOUNT - 25);
+    assert_eq!(tc.balance(buyer), 0);
+    assert_eq!(tc.balance(&contract_id), 0);
+    assert_eq!(
+        tc.balance(arbiter) + tc.balance(seller) + tc.balance(buyer),
+        AMOUNT,
+        "fee plus award must equal the disputed balance"
+    );
+    let record = client.get_escrow(&id);
+    assert_eq!(record.status, EscrowStatus::Completed);
+    assert_eq!(record.released, record.amount);
+}
+
+#[test]
+fn resolve_split_deducts_the_fee_before_splitting_the_remainder() {
+    let (_env, token, tc, contract_id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create_with_fee(&client, &token, buyer, seller, arbiter, MAX_ARBITER_FEE_BPS);
+    client.deposit(&id);
+    client.dispute(&id, buyer);
+
+    client.resolve_split(&id, &6_000);
+
+    // 10% fee = 100; the remaining 900 splits 60/40.
+    assert_eq!(tc.balance(arbiter), 100);
+    assert_eq!(tc.balance(seller), 540);
+    assert_eq!(tc.balance(buyer), 360);
+    assert_eq!(tc.balance(&contract_id), 0);
+    assert_eq!(
+        tc.balance(arbiter) + tc.balance(seller) + tc.balance(buyer),
+        AMOUNT
+    );
+    assert_eq!(client.get_status(&id), EscrowStatus::Completed);
+}
+
+#[test]
+fn arbiter_fee_rounds_down_and_still_conserves() {
+    let (_env, token, tc, contract_id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let amount = 999_i128;
+    let id = client
+        .create_escrow_with_arbiter_fee(buyer, seller, arbiter, &token, &amount, &TIMEOUT, &333);
+    client.deposit(&id);
+    client.dispute(&id, buyer);
+
+    client.resolve(&id, &false);
+
+    // floor(999 * 333 / 10_000) = 33, so the buyer is awarded 966. The buyer
+    // also keeps the 1 unit that was never deposited.
+    assert_eq!(tc.balance(arbiter), 33);
+    assert_eq!(tc.balance(buyer), 967);
+    assert_eq!(tc.balance(&contract_id), 0);
+    assert_eq!(client.get_status(&id), EscrowStatus::Refunded);
+}
+
+#[test]
+fn failed_fee_transfer_leaves_the_dispute_unresolved() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(START);
+    let token = env.register(FailureToken, ());
+    let token_client = FailureTokenClient::new(&env, &token);
+    let contract_id = env.register(Escrow, ());
+    let client = SorobanForgeEscrowClient::new(&env, &contract_id);
+    let accounts = soroban_forge_test_utils::TestAccounts::generate(&env);
+    token_client.mint(&accounts.user1, &AMOUNT);
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create_with_fee(&client, &token, buyer, seller, arbiter, 500);
+    client.deposit(&id);
+    client.dispute(&id, buyer);
+
+    // The first transfer of the resolve is the arbiter fee.
+    token_client.set_fail_before_transfer(&true);
+    let err = client.try_resolve(&id, &true).unwrap_err().unwrap();
+
+    assert_eq!(err, ForgeError::TokenTransferFailed);
+    assert_eq!(client.get_status(&id), EscrowStatus::Disputed);
+    assert_eq!(token_client.balance(&contract_id), AMOUNT);
+    assert_eq!(token_client.balance(arbiter), 0);
+    assert_eq!(token_client.balance(seller), 0);
 }
